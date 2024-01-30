@@ -12,37 +12,45 @@ pub fn heartbeats<'a, D: Deploy<'a>>(
 ) -> D::Cluster {
     let cluster = flow.cluster(cluster_spec);
 
-    // generate heartbeats every 100ms
+    // members: a persistent hf+ collection of the cluster ids
+    let members = cluster.source_iter(cluster.ids()).all_ticks();
+
+    // generate a heartbeat every 100ms
     let hbs = cluster
         .source_interval(q!(Duration::from_millis(100)))
         .map(q!(|_| Message::Heartbeat))
         .tick_batch();
 
-    // helper to count how many heartbeats we have sent to each node
-    // we generate a 1 for each heartbeat we send and sum these into the totals later
-    let node_incr_pairs = hbs
-        .map(q!(|_| 1i32))
-        .cross_product(&cluster.source_iter(cluster.ids()).all_ticks().cloned())
-        .map(q!(|(incr, id)| (id, incr)));
+    // generate a heartbeat msg for each recipient
+    let node_ack_pairs = hbs
+        .cross_product(&members.cloned())
+        .map(q!(|(msg, id)| (id, msg)));
 
-    // send/receive heartbeats
+    // scatter heartbeats, gather acks
     let acks = hbs
-        .broadcast_bincode_tagged(&cluster)
+        .broadcast_bincode_tagged(&cluster) // broadcast to cluster, tagged with sender id
+        // at each cluster member
         .inspect(q!(|n| println!("Received {:?}", n)))
-        .demux_bincode_tagged(&cluster)
-        .inspect(q!(|n| println!("Acked {:?}", n)))
-        //use a -1 to decrement the outsanding heartbeats for each node we hear an ack from
-        .map(q!(|(id, _)| (id, -1i32)))
+        .map(q!(|(id, _m)| (id, Message::HeartbeatAck))) // generate an Ack
+        .filter(q!(|_m| rand::random::<f32>() < 0.3)) // artifical drop for testing
+        .demux_bincode_tagged(&cluster) // return Ack to sender
+        // back at sender
+        .inspect(q!(|n| println!("Got Ack {:?}", n)))
         .tick_batch();
 
     // track each nodes sent heartbeats and sets the unacked count to 0 when an ack comes in
-    let unacked_hbs = node_incr_pairs.union(&acks).all_ticks().fold(
-        q!(HashMap::<u32, i32>::new),
-        q!(|accum, (id, m)| {
-            if (m > 0) {
-                *accum.entry(id).or_insert(0) += m
-            } else {
-                accum.entry(id).or_insert(0);
+    let unacked_hbs = node_ack_pairs.union(&acks).all_ticks().fold(
+        q!(HashMap::<u32, usize>::new), // state is a hashmap from node_id => count
+        q!(|accum, (id, msg)| {
+            match msg {
+                Message::Heartbeat => {
+                    // increment for each Heartbeat
+                    *accum.entry(id).or_insert(0) += 1
+                }
+                Message::HeartbeatAck => {
+                    // reset to 0 on any HeartbeatAck
+                    *accum.entry(id).or_insert(0) = 0
+                }
             }
         }),
     );
@@ -51,11 +59,11 @@ pub fn heartbeats<'a, D: Deploy<'a>>(
     cluster
         .source_interval(q!(Duration::from_millis(1000)))
         .tick_batch()
-        .cross_product(&unacked_hbs)
+        .cross_product(&unacked_hbs) // attach a handle to the unacked_hbs state
         .map(q!(|(_, unacked_hbs)| unacked_hbs))
-        .flat_map(q!(|h| h.into_iter()))
-        .filter(q!(|(key, value)| *value > 3))
-        .for_each(q!(|n| println!("dead_list: {:?}", n)));
+        .flat_map(q!(|h| h.into_iter())) // go through the entries of unacked_hbs
+        .filter(q!(|(_key, value)| *value > 3)) // a node has counted 3 unanswered acks in a row
+        .for_each(q!(|n| println!("---------\ndead_list: {:?}\n---------", n)));
 
     cluster
 }
@@ -71,3 +79,4 @@ pub fn heartbeats_runtime<'a>(
     let _ = heartbeats(flow, &cli);
     flow.build(q!(cli.meta.subgraph_id))
 }
+
