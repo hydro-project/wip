@@ -13,13 +13,13 @@ pub fn heartbeats<'a, D: Deploy<'a>>(
     let cluster = flow.cluster(cluster_spec);
 
     // members: a persistent hf+ collection of the cluster ids
-    let members = cluster.source_iter(cluster.ids()).all_ticks();
+    let members = cluster.source_iter(cluster.ids()).all_ticks(); // persistent state across ticks
 
     // generate a heartbeat every 100ms
     let hbs = cluster
         .source_interval(q!(Duration::from_millis(100)))
         .map(q!(|_| Message::Heartbeat))
-        .tick_batch();
+        .tick_batch(); // transient state per tick
 
     // generate a heartbeat msg for each recipient
     let node_ack_pairs = hbs
@@ -30,15 +30,16 @@ pub fn heartbeats<'a, D: Deploy<'a>>(
     let acks = hbs
         .broadcast_bincode_tagged(&cluster) // broadcast to cluster, tagged with sender id
         // at each cluster member
-        .inspect(q!(|n| println!("Received {:?}", n)))
+        .inspect(q!(|n| println!("Received {:?}", n))) // debugging info
         .map(q!(|(id, _m)| (id, Message::HeartbeatAck))) // generate an Ack
-        .filter(q!(|_m| rand::random::<f32>() < 0.3)) // artifical drop for testing
+        .filter(q!(|_m| rand::random::<f32>() < 0.3)) // artificial drop for testing
         .demux_bincode_tagged(&cluster) // return Ack to sender
         // back at sender
         .inspect(q!(|n| println!("Got Ack {:?}", n)))
         .tick_batch();
 
     // track each nodes sent heartbeats and sets the unacked count to 0 when an ack comes in
+    // this state is persistent across ticks (all_ticks())
     let unacked_hbs = node_ack_pairs.union(&acks).all_ticks().fold(
         q!(HashMap::<u32, usize>::new), // state is a hashmap from node_id => count
         q!(|accum, (id, msg)| {
@@ -58,12 +59,12 @@ pub fn heartbeats<'a, D: Deploy<'a>>(
     // every second, check which nodes have missed their last 3 heartbeats or more
     cluster
         .source_interval(q!(Duration::from_millis(1000)))
-        .tick_batch()
+        .tick_batch() // this "pulse" is transient state
         .cross_product(&unacked_hbs) // attach a handle to the unacked_hbs state
         .map(q!(|(_, unacked_hbs)| unacked_hbs))
         .flat_map(q!(|h| h.into_iter())) // go through the entries of unacked_hbs
         .filter(q!(|(_key, value)| *value > 3)) // a node has counted 3 unanswered acks in a row
-        .for_each(q!(|n| println!("---------\ndead_list: {:?}\n---------", n)));
+        .for_each(q!(|n| println!("---------\ndead_list: {:?}\n---------", n))); // debugging
 
     cluster
 }
@@ -79,4 +80,3 @@ pub fn heartbeats_runtime<'a>(
     let _ = heartbeats(flow, &cli);
     flow.build(q!(cli.meta.subgraph_id))
 }
-
